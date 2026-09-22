@@ -11,6 +11,9 @@ import {
 } from "antlr4ng";
 
 import { longestCommonPrefix } from "./utils.js";
+import {
+    CandidateTracer, CandidateTraceTransitionKind, ICandidateTraceOptions, ICandidateTraceResult,
+} from "./CandidateTracing.js";
 
 export type TokenList = number[];
 export type RuleList = number[];
@@ -72,6 +75,8 @@ type RuleEndStatus = Set<number>;
 interface IPipelineEntry {
     state: ATNState;
     tokenListIndex: number;
+    /** Index of the trace step event which led to this entry (only set when tracing is enabled). */
+    traceParent?: number;
 }
 
 /** The main class for doing the collection process. */
@@ -94,6 +99,19 @@ export class CodeCompletionCore {
         "loop end",
     ];
 
+    private static transitionKindMap: Record<number, CandidateTraceTransitionKind> = {
+        [Transition.EPSILON]: "epsilon",
+        [Transition.RANGE]: "range",
+        [Transition.RULE]: "rule",
+        [Transition.PREDICATE]: "predicate",
+        [Transition.ATOM]: "atom",
+        [Transition.ACTION]: "action",
+        [Transition.SET]: "set",
+        [Transition.NOT_SET]: "not-set",
+        [Transition.WILDCARD]: "wildcard",
+        [Transition.PRECEDENCE]: "precedence",
+    };
+
     // Debugging options. Print human readable ATN state and other info.
 
     /** Not dependent on showDebugOutput. Prints the collected rules + tokens to terminal. */
@@ -107,6 +125,14 @@ export class CodeCompletionCore {
 
     /** Also depends on showDebugOutput. Enables call stack printing for each rule recursion. */
     public showRuleStack = false;
+
+    /**
+     * Diagnostic only: when set, the next `collectCandidates` run records a structured candidate trace
+     * (ATN path, rule stack and the first decisive condition for every selected or excluded candidate).
+     * Tracing never changes the collected candidates. When undefined no trace data is recorded and the
+     * hot path performs no extra allocations.
+     */
+    public candidateTraceOptions?: ICandidateTraceOptions;
 
     /**
      * Tailoring of the result:
@@ -145,6 +171,9 @@ export class CodeCompletionCore {
     /** The collected candidates (rules and tokens). */
     private candidates: CandidatesCollection = new CandidatesCollection();
 
+    private tracer?: CandidateTracer;
+    private traceResult?: ICandidateTraceResult;
+
     public constructor(parser: Parser) {
         this.parser = parser;
         this.atn = parser.atn;
@@ -152,6 +181,15 @@ export class CodeCompletionCore {
         this.ruleNames = parser.ruleNames;
         this.ignoredTokens = new Set();
         this.preferredRules = new Set();
+    }
+
+    /**
+     * The trace of the last `collectCandidates` run, or undefined when tracing was not enabled.
+     *
+     * @returns The structured candidate trace.
+     */
+    public get candidateTrace(): ICandidateTraceResult | undefined {
+        return this.traceResult;
     }
 
     /**
@@ -171,6 +209,8 @@ export class CodeCompletionCore {
         this.candidates.tokens.clear();
         this.statesProcessed = 0;
         this.precedenceStack = [];
+        this.tracer = this.candidateTraceOptions ? new CandidateTracer(this.candidateTraceOptions) : undefined;
+        this.traceResult = undefined;
 
         this.tokenStartIndex = context?.start ? context.start.tokenIndex : 0;
         // eslint-disable-next-line no-underscore-dangle
@@ -201,6 +241,7 @@ export class CodeCompletionCore {
         const callStack: RuleWithStartTokenList = [];
         const startRule = context ? context.ruleIndex : 0;
         this.processRule(this.atn.ruleToStartState[startRule]!, 0, callStack, 0, 0);
+        this.traceResult = this.tracer?.finish();
 
         if (this.showResult) {
             console.log(`States processed: ${this.statesProcessed}`);
@@ -312,6 +353,14 @@ export class CodeCompletionCore {
                     console.log("=====> collected: ", this.ruleNames[ruleIndex]);
                 }
             }
+            this.tracer?.recordDecision({
+                candidateKind: "rule",
+                ruleIndex,
+                status: "selected",
+                reason: "preferred-rule",
+                merged: !addNew,
+                callStack: path,
+            });
 
             return true;
         }
@@ -469,10 +518,23 @@ export class CodeCompletionCore {
      * @param callStack The stack that indicates where in the ATN we are currently.
      * @param precedence The current precedence level.
      * @param indentation A value to determine the current indentation when doing debug prints.
+     * @param traceParent The trace step which led into this rule (only used when tracing is enabled).
      * @returns the set of token stream indexes (which depend on the ways that had to be taken).
      */
     private processRule(startState: RuleStartState, tokenListIndex: number, callStack: RuleWithStartTokenList,
-        precedence: number, indentation: number): RuleEndStatus {
+        precedence: number, indentation: number, traceParent = -1): RuleEndStatus {
+
+        if (this.tracer) {
+            this.tracer.currentStep = this.tracer.recordStep({
+                parent: traceParent,
+                stateNumber: startState.stateNumber,
+                stateType: CodeCompletionCore.atnStateTypeMap[ATNState.RULE_START],
+                ruleIndex: startState.ruleIndex,
+                tokenListIndex,
+                transitionKind: traceParent >= 0 ? "rule" : undefined,
+                transitionTarget: startState.stateNumber,
+            });
+        }
 
         // Start with rule specific handling before going into the ATN walk.
 
@@ -483,6 +545,7 @@ export class CodeCompletionCore {
             this.shortcutMap.set(startState.ruleIndex, positionMap);
         } else {
             if (positionMap.has(tokenListIndex)) {
+                this.tracer?.recordSkip("shortcut", startState.ruleIndex, tokenListIndex);
                 if (this.showDebugOutput) {
                     console.log("=====> shortcut");
                 }
@@ -508,9 +571,12 @@ export class CodeCompletionCore {
 
         let followSets = setsPerState.get(startState.stateNumber);
         if (!followSets) {
+            this.tracer?.recordCacheEvent(false, startState.stateNumber, startState.ruleIndex);
             const stop = this.atn.ruleToStopState[startState.ruleIndex]!;
             followSets = this.determineFollowSets(startState, stop);
             setsPerState.set(startState.stateNumber, followSets);
+        } else {
+            this.tracer?.recordCacheEvent(true, startState.stateNumber, startState.ruleIndex);
         }
 
         // Get the token index where our rule starts from our (possibly filtered) token list
@@ -543,10 +609,11 @@ export class CodeCompletionCore {
                     if (!this.translateStackToRuleIndex(fullPath)) {
                         for (const symbol of set.intervals.toArray()) {
                             if (!this.ignoredTokens.has(symbol)) {
+                                const merged = this.candidates.tokens.has(symbol);
                                 if (this.showDebugOutput) {
                                     console.log("=====> collected: ", this.vocabulary.getDisplayName(symbol));
                                 }
-                                if (!this.candidates.tokens.has(symbol)) {
+                                if (!merged) {
                                     // Following is empty if there is more than one entry in the set.
                                     this.candidates.tokens.set(symbol, set.following);
                                 } else {
@@ -555,6 +622,27 @@ export class CodeCompletionCore {
                                         this.candidates.tokens.set(symbol, []);
                                     }
                                 }
+                                this.tracer?.recordDecision({
+                                    candidateKind: "token",
+                                    tokenType: symbol,
+                                    status: "selected",
+                                    reason: "follow-set",
+                                    merged,
+                                    callStack: fullPath.map(({ ruleIndex }) => {
+                                        return ruleIndex;
+                                    }),
+                                });
+                            } else {
+                                this.tracer?.recordDecision({
+                                    candidateKind: "token",
+                                    tokenType: symbol,
+                                    status: "excluded",
+                                    reason: "ignored-token",
+                                    merged: false,
+                                    callStack: fullPath.map(({ ruleIndex }) => {
+                                        return ruleIndex;
+                                    }),
+                                });
                             }
                         }
                     }
@@ -577,6 +665,7 @@ export class CodeCompletionCore {
             // Otherwise stop here.
             const currentSymbol = this.tokens[tokenListIndex].type;
             if (followSets.isExhaustive && !followSets.combined.contains(currentSymbol)) {
+                this.tracer?.recordSkip("follow-set-miss", startState.ruleIndex, tokenListIndex);
                 callStack.pop();
 
                 return result;
@@ -593,11 +682,19 @@ export class CodeCompletionCore {
         let currentEntry;
 
         // Bootstrap the pipeline.
-        statePipeline.push({ state: startState, tokenListIndex });
+        if (this.tracer) {
+            // Reuse the rule entry step recorded above instead of recording the same state twice.
+            statePipeline.push({ state: startState, tokenListIndex, traceParent: this.tracer.currentStep });
+        } else {
+            statePipeline.push({ state: startState, tokenListIndex });
+        }
 
         while (statePipeline.length > 0) {
             currentEntry = statePipeline.pop()!;
             ++this.statesProcessed;
+            if (this.tracer) {
+                this.tracer.currentStep = currentEntry.traceParent ?? -1;
+            }
 
             const currentSymbol = this.tokens[currentEntry.tokenListIndex].type;
 
@@ -625,33 +722,35 @@ export class CodeCompletionCore {
                     case Transition.RULE: {
                         const ruleTransition = transition as RuleTransition;
                         const endStatus = this.processRule(transition.target as RuleStartState,
-                            currentEntry.tokenListIndex, callStack, ruleTransition.precedence, indentation + 1);
+                            currentEntry.tokenListIndex, callStack, ruleTransition.precedence, indentation + 1,
+                            currentEntry.traceParent ?? -1);
                         for (const position of endStatus) {
-                            statePipeline.push({
-                                state: (<RuleTransition>transition).followState,
-                                tokenListIndex: position,
-                            });
+                            this.pushPipelineEntry(statePipeline, ruleTransition.followState, position,
+                                currentEntry.traceParent ?? -1, "rule");
                         }
                         break;
                     }
 
                     case Transition.PREDICATE: {
-                        if (this.checkPredicate(transition as PredicateTransition)) {
-                            statePipeline.push({
-                                state: transition.target,
-                                tokenListIndex: currentEntry.tokenListIndex,
-                            });
+                        const predicateResult = this.checkPredicate(transition as PredicateTransition);
+                        if (predicateResult) {
+                            this.pushPipelineEntry(statePipeline, transition.target, currentEntry.tokenListIndex,
+                                currentEntry.traceParent ?? -1, "predicate", undefined, true);
+                        } else {
+                            this.recordDeadEndStep(currentEntry, transition, "predicate", false);
                         }
                         break;
                     }
 
                     case Transition.PRECEDENCE: {
                         const predTransition = transition as PrecedencePredicateTransition;
-                        if (predTransition.precedence >= this.precedenceStack[this.precedenceStack.length - 1]) {
-                            statePipeline.push({
-                                state: transition.target,
-                                tokenListIndex: currentEntry.tokenListIndex,
-                            });
+                        const precedenceResult =
+                            predTransition.precedence >= this.precedenceStack[this.precedenceStack.length - 1];
+                        if (precedenceResult) {
+                            this.pushPipelineEntry(statePipeline, transition.target, currentEntry.tokenListIndex,
+                                currentEntry.traceParent ?? -1, "precedence", undefined, true);
+                        } else {
+                            this.recordDeadEndStep(currentEntry, transition, "precedence", false);
                         }
 
                         break;
@@ -663,15 +762,35 @@ export class CodeCompletionCore {
                                 for (const token of IntervalSet.of(Token.MIN_USER_TOKEN_TYPE, this.atn.maxTokenType)
                                     .toArray()) {
                                     if (!this.ignoredTokens.has(token)) {
+                                        const merged = this.candidates.tokens.has(token);
                                         this.candidates.tokens.set(token, []);
+                                        this.tracer?.recordDecision({
+                                            candidateKind: "token",
+                                            tokenType: token,
+                                            status: "selected",
+                                            reason: "wildcard",
+                                            merged,
+                                            callStack: callStack.map(({ ruleIndex }) => {
+                                                return ruleIndex;
+                                            }),
+                                        });
+                                    } else {
+                                        this.tracer?.recordDecision({
+                                            candidateKind: "token",
+                                            tokenType: token,
+                                            status: "excluded",
+                                            reason: "ignored-token",
+                                            merged: false,
+                                            callStack: callStack.map(({ ruleIndex }) => {
+                                                return ruleIndex;
+                                            }),
+                                        });
                                     }
                                 }
                             }
                         } else {
-                            statePipeline.push({
-                                state: transition.target,
-                                tokenListIndex: currentEntry.tokenListIndex + 1,
-                            });
+                            this.pushPipelineEntry(statePipeline, transition.target, currentEntry.tokenListIndex + 1,
+                                currentEntry.traceParent ?? -1, "wildcard");
                         }
                         break;
                     }
@@ -679,10 +798,8 @@ export class CodeCompletionCore {
                     default: {
                         if (transition.isEpsilon) {
                             // Jump over simple states with a single outgoing epsilon transition.
-                            statePipeline.push({
-                                state: transition.target,
-                                tokenListIndex: currentEntry.tokenListIndex,
-                            });
+                            this.pushPipelineEntry(statePipeline, transition.target, currentEntry.tokenListIndex,
+                                currentEntry.traceParent ?? -1, "epsilon");
                             continue;
                         }
 
@@ -706,7 +823,8 @@ export class CodeCompletionCore {
                                             const followingTokens = hasTokenSequence
                                                 ? this.getFollowingTokens(transition)
                                                 : [];
-                                            if (!this.candidates.tokens.has(symbol)) {
+                                            const merged = this.candidates.tokens.has(symbol);
+                                            if (!merged) {
                                                 this.candidates.tokens.set(symbol, followingTokens);
                                             } else {
                                                 this.candidates.tokens.set(
@@ -714,6 +832,27 @@ export class CodeCompletionCore {
                                                     longestCommonPrefix(followingTokens,
                                                         this.candidates.tokens.get(symbol)));
                                             }
+                                            this.tracer?.recordDecision({
+                                                candidateKind: "token",
+                                                tokenType: symbol,
+                                                status: "selected",
+                                                reason: "transition",
+                                                merged,
+                                                callStack: callStack.map(({ ruleIndex }) => {
+                                                    return ruleIndex;
+                                                }),
+                                            });
+                                        } else {
+                                            this.tracer?.recordDecision({
+                                                candidateKind: "token",
+                                                tokenType: symbol,
+                                                status: "excluded",
+                                                reason: "ignored-token",
+                                                merged: false,
+                                                callStack: callStack.map(({ ruleIndex }) => {
+                                                    return ruleIndex;
+                                                }),
+                                            });
                                         }
                                     }
                                 }
@@ -722,10 +861,10 @@ export class CodeCompletionCore {
                                     console.log("=====> consumed: ", this.vocabulary.getDisplayName(currentSymbol));
                                 }
 
-                                statePipeline.push({
-                                    state: transition.target,
-                                    tokenListIndex: currentEntry.tokenListIndex + 1,
-                                });
+                                this.pushPipelineEntry(statePipeline, transition.target,
+                                    currentEntry.tokenListIndex + 1, currentEntry.traceParent ?? -1,
+                                    CodeCompletionCore.transitionKindMap[transition.transitionType],
+                                    set.toArray());
                             }
                         }
                     }
@@ -749,6 +888,69 @@ export class CodeCompletionCore {
         const typeName = CodeCompletionCore.atnStateTypeMap[(state.constructor as typeof ATNState).stateType];
 
         return `[${stateValue} ${typeName}] in ${this.ruleNames[state.ruleIndex]}`;
+    }
+
+    /**
+     * Pushes a new entry onto the state pipeline. When tracing is enabled this also records a trace step for the
+     * transition which led to the new state. When tracing is disabled this performs exactly the same allocation
+     * as a plain `pipeline.push({ state, tokenListIndex })`.
+     *
+     * @param pipeline The pipeline to push to.
+     * @param state The ATN state to push.
+     * @param tokenListIndex The token index for the new entry.
+     * @param parentStep The trace step of the entry this transition originates from.
+     * @param transitionKind The kind of the transition which led to the state.
+     * @param transitionLabel The (effective) label of the transition, if any.
+     * @param predicateResult The evaluation result for predicate/precedence transitions.
+     */
+    private pushPipelineEntry(pipeline: IPipelineEntry[], state: ATNState, tokenListIndex: number, parentStep: number,
+        transitionKind?: CandidateTraceTransitionKind, transitionLabel?: number[], predicateResult?: boolean): void {
+
+        if (!this.tracer) {
+            pipeline.push({ state, tokenListIndex });
+
+            return;
+        }
+
+        const stepIndex = this.tracer.recordStep({
+            parent: parentStep,
+            stateNumber: state.stateNumber,
+            stateType: CodeCompletionCore.atnStateTypeMap[(state.constructor as typeof ATNState).stateType],
+            ruleIndex: state.ruleIndex,
+            tokenListIndex,
+            transitionKind,
+            transitionLabel: transitionLabel ? [...transitionLabel].sort((a, b) => {
+                return a - b;
+            }) : undefined,
+            transitionTarget: transitionKind ? state.stateNumber : undefined,
+            predicateResult,
+        });
+        pipeline.push({ state, tokenListIndex, traceParent: stepIndex });
+    }
+
+    /**
+     * Records a trace step for a transition which was evaluated but not taken (e.g. a predicate which
+     * evaluated to false). Only called when tracing is enabled.
+     *
+     * @param entry The pipeline entry the transition originates from.
+     * @param transition The transition which was not taken.
+     * @param kind The kind of the transition.
+     * @param predicateResult The evaluation result of the transition's predicate.
+     */
+    private recordDeadEndStep(entry: IPipelineEntry, transition: Transition,
+        kind: CandidateTraceTransitionKind, predicateResult: boolean): void {
+
+        this.tracer?.recordStep({
+            parent: entry.traceParent ?? -1,
+            stateNumber: transition.target.stateNumber,
+            stateType: CodeCompletionCore.atnStateTypeMap[
+                (transition.target.constructor as typeof ATNState).stateType],
+            ruleIndex: transition.target.ruleIndex,
+            tokenListIndex: entry.tokenListIndex,
+            transitionKind: kind,
+            transitionTarget: transition.target.stateNumber,
+            predicateResult,
+        });
     }
 
     private printDescription(indentation: number, state: ATNState, baseDescription: string, tokenIndex: number) {

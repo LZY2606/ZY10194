@@ -4,6 +4,11 @@ grammar Whitebox;
 /* eslint-disable @typescript-eslint/no-unused-vars, no-useless-escape */
 }
 
+@members {
+    // Used by test10 to exercise predicate handling in candidate traces.
+    public rejectIpsum = true;
+}
+
 test1: rule1 ADIPISCING ;
 rule1: rule2 CONSECTETUR ;
 rule2: LOREM rule3 rule5 SIT* AMET? ;
@@ -36,6 +41,10 @@ rule22: IPSUM DOLOR (AMET | CONSECTETUR) ;
 test7: LOREM (IPSUM DOLOR SIT | IPSUM DOLOR AMET) ;
 
 test8: LOREM (IPSUM DOLOR SIT AMET | IPSUM DOLOR SIT CONSECTETUR) ;
+
+test9: LOREM . CONSECTETUR ;
+
+test10: LOREM ({this.rejectIpsum}? IPSUM | {!this.rejectIpsum}? DOLOR) AMET ;
 
 LOREM: 'LOREM';
 IPSUM: 'IPSUM';

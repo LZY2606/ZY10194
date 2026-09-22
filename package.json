@@ -23,6 +23,7 @@
         "build": "tsc && npm run build-cjs && npm run build-mjs",
         "prepublishOnly": "npm run build && npm run generate && npm run test",
         "test-coverage": "npm run test --coverage",
+        "pretest": "npm run generate",
         "test": "vitest run --no-watch --no-coverage",
         "generate": "antlr-ng -Dlanguage=TypeScript tests/CPP14.g4 tests/Expr.g4 tests/Whitebox.g4 -l false -o tests/generated --exact-output-dir",
         "eslint": "eslint .",

@@ -225,6 +225,33 @@ Sometimes you are not getting what you actually expect and you need take a close
 
 The last two options potentially create a lot of output which can significantly slow down the collection process.
 
+## Candidate Tracing
+
+For deeper diagnosis (and for testing completion setups) the engine can record a structured candidate trace. Enable it by assigning trace options before calling `collectCandidates()` and read the result afterwards:
+
+```typescript
+core.candidateTraceOptions = { maxEvents: 10000, maxWitnesses: 3 };
+const candidates = core.collectCandidates(caretIndex);
+const trace = core.candidateTrace;
+```
+
+The trace is recorded by the real traversal in `collectCandidates`/`processRule` (it never simulates a separate walk) and contains only stable data: ATN state numbers, state/transition type names, token types, rule indexes and token list indexes. It never contains object identities or address dependent debug strings, so traces can be diffed and snapshot-tested.
+
+For every selected or excluded candidate (`trace.candidates`) you get:
+
+- `status`/`reason`: the first decisive condition (`follow-set`, `transition`, `wildcard`, `preferred-rule` for selected candidates, `ignored-token` for excluded ones).
+- `callStack`: the rule stack (rule indexes, outermost first) at that condition.
+- `pathCount`/`mergeCount`: how many traversal paths reached a decision for this candidate and how many of them merged into an already collected candidate. A candidate reached via multiple paths is never reported as unique.
+- `witnesses`: up to `maxWitnesses` (default 3) shortest ATN paths leading to a decision for this candidate.
+
+Additionally `trace.events` holds the bounded chronological event log (ATN steps incl. predicate/precedence evaluation results, follow set cache hits/misses, skipped rules via the shortcut map or non-matching follow sets) and `trace.followSetCache` summarizes the cache statistics. Candidates are sorted deterministically by candidate kind, token type/rule index and a stable path key - never by set insertion order.
+
+Semantics and trade-offs:
+
+- Tracing never changes the collected candidates. When the event limit (`maxEvents`, default 10000) is reached, the trace is marked `truncated`, further events are dropped (and counted in `droppedEvents`), while candidate collection continues unaffected.
+- With tracing disabled (`candidateTraceOptions` undefined, the default) the hot path performs no extra allocations beyond a few property reads. With tracing enabled expect a noticeable slow down (roughly 1.5-2x on large inputs) plus memory for the event log - use it for diagnosis and tests only.
+- The trace is per `collectCandidates()` run and not part of the stable public API guarantees; field names may evolve between minor versions.
+
 ## Release Notes
 
 See [release notes](./release-notes.md).
